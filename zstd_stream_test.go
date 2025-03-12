@@ -67,6 +67,40 @@ func testCompressionDecompression(t *testing.T, dict []byte, payload []byte, nbW
 	failOnError(t, "Failed to close decompress object", r.Close())
 }
 
+func testDecompressWriter(t *testing.T, dict []byte, payload []byte) {
+	// First, compress the data
+	compressedData, err := Compress(nil, payload)
+	failOnError(t, "Failed to compress test data", err)
+
+	// Create a buffer to capture decompressed output
+	var decompressed bytes.Buffer
+
+	// Create a new decompressWriter, passing in the buffer to collect results
+	decompWriter := NewDecompressWriterDict(&decompressed, dict)
+
+	// Write the compressed data to the decompressWriter
+	n, err := decompWriter.Write(compressedData)
+	failOnError(t, "Failed to write compressed data to decompressWriter", err)
+
+	if n != len(compressedData) {
+		t.Fatalf("decompressWriter.Write did not consume all bytes: %v != %v", n, len(compressedData))
+	}
+
+	// Close the writer to ensure all data is flushed
+	err = decompWriter.Close()
+	failOnError(t, "Failed to close decompressWriter", err)
+
+	// Verify the decompressed data matches the original input
+	result := decompressed.Bytes()
+	if !bytes.Equal(payload, result) {
+		if len(payload) < 100 && len(result) < 100 {
+			t.Fatalf("Decompression failed: %s != %s", payload, result)
+		} else {
+			t.Fatalf("Decompression failed (lengths: %v bytes & %v bytes)", len(payload), len(result))
+		}
+	}
+}
+
 func TestResize(t *testing.T) {
 	if len(resize(nil, 129)) != 129 {
 		t.Fatalf("Cannot allocate new slice")
@@ -412,6 +446,120 @@ func TestStreamSetNbWorkers(t *testing.T) {
 
 	nbWorkers := 4
 	testCompressionDecompression(t, nil, []byte(s), nbWorkers)
+}
+
+func TestDecompressWriterSimple(t *testing.T) {
+	testDecompressWriter(t, nil, []byte("Hello world!"))
+}
+
+func TestDecompressWriterEmpty(t *testing.T) {
+	testDecompressWriter(t, nil, []byte{})
+}
+
+func TestDecompressWriterLong(t *testing.T) {
+	var long bytes.Buffer
+	for i := 0; i < 10000; i++ {
+		long.Write([]byte("Hello World!"))
+	}
+	testDecompressWriter(t, nil, long.Bytes())
+}
+
+func TestDecompressWriterDict(t *testing.T) {
+	dict := []byte("Hello Dictionary")
+	testDecompressWriter(t, dict, []byte("Hello world with dictionary!"))
+}
+
+func TestDecompressWriterChunks(t *testing.T) {
+	payload := []byte("Hello chunked decompression test")
+
+	// Compress the data
+	compressed, err := Compress(nil, payload)
+	failOnError(t, "Failed to compress test data", err)
+
+	// Split the compressed data into chunks
+	chunkSize := 4
+	var chunks [][]byte
+	for i := 0; i < len(compressed); i += chunkSize {
+		end := i + chunkSize
+		if end > len(compressed) {
+			end = len(compressed)
+		}
+		chunks = append(chunks, compressed[i:end])
+	}
+
+	// Create a buffer to capture decompressed output
+	var decompressed bytes.Buffer
+
+	// Create a new decompressWriter
+	decompWriter := NewDecompressWriter(&decompressed)
+
+	// Write each chunk
+	for _, chunk := range chunks {
+		_, err := decompWriter.Write(chunk)
+		failOnError(t, "Failed to write chunk to decompressWriter", err)
+	}
+
+	// Close to flush any remaining data
+	err = decompWriter.Close()
+	failOnError(t, "Failed to close decompressWriter", err)
+
+	// Verify the result
+	if !bytes.Equal(payload, decompressed.Bytes()) {
+		t.Fatalf("Chunked decompression failed: expected %q, got %q", payload, decompressed.Bytes())
+	}
+}
+
+func TestDecompressWriterError(t *testing.T) {
+	// Create invalid compressed data (just random bytes)
+	invalidData := []byte{0x1, 0x2, 0x3, 0x4, 0x5}
+
+	var outputBuf bytes.Buffer
+	decompWriter := NewDecompressWriter(&outputBuf)
+
+	// This should fail because the data is not valid zstd compressed data
+	_, err := decompWriter.Write(invalidData)
+	if err == nil {
+		t.Fatal("Expected an error when decompressing invalid data, but got none")
+	}
+
+	// Close should also return the same error
+	err = decompWriter.Close()
+	if err == nil {
+		t.Fatal("Expected Close() to return an error after a failed Write")
+	}
+}
+
+func BenchmarkDecompressWriter(b *testing.B) {
+	if raw == nil {
+		b.Fatal(ErrNoPayloadEnv)
+	}
+
+	// Compress the test data
+	compressed, err := Compress(nil, raw)
+	if err != nil {
+		b.Fatalf("Failed to compress: %s", err)
+	}
+
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		var buf bytes.Buffer
+		w := NewDecompressWriter(&buf)
+		_, err := w.Write(compressed)
+		if err != nil {
+			b.Fatalf("Failed to decompress: %s", err)
+		}
+		err = w.Close()
+		if err != nil {
+			b.Fatalf("Failed to close decompressor: %s", err)
+		}
+
+		// Verify the result in benchmark too
+		if !bytes.Equal(raw, buf.Bytes()) {
+			b.Fatal("Decompression produced incorrect output")
+		}
+	}
 }
 
 func BenchmarkStreamCompression(b *testing.B) {

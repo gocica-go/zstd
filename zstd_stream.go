@@ -533,3 +533,136 @@ func (r *reader) Read(p []byte) (int, error) {
 		}
 	}
 }
+
+type decompressWriter struct {
+	ctx                 *C.ZSTD_DCtx
+	dict                []byte
+	underlyingWriter    io.Writer
+	compressionBuffer   []byte
+	decompressionBuffer []byte
+	firstError          error
+	resultBuffer        *C.decompressStream2_result
+}
+
+func NewDecompressWriter(w io.Writer) io.WriteCloser {
+	return NewDecompressWriterDict(w, nil)
+}
+
+func NewDecompressWriterDict(w io.Writer, dict []byte) io.WriteCloser {
+	var err error
+	ctx := C.ZSTD_createDStream()
+	if len(dict) == 0 {
+		err = getError(int(C.ZSTD_initDStream(ctx)))
+	} else {
+		err = getError(int(C.ZSTD_DCtx_reset(ctx, C.ZSTD_reset_session_only)))
+		if err == nil {
+			// Only load dictionary if we succesfully inited the context
+			err = getError(int(C.ZSTD_DCtx_loadDictionary(
+				ctx,
+				unsafe.Pointer(&dict[0]),
+				C.size_t(len(dict)))))
+		}
+	}
+	compressionBufferP := cPool.Get().(*[]byte)
+	decompressionBufferP := dPool.Get().(*[]byte)
+	return &decompressWriter{
+		ctx:                 ctx,
+		dict:                dict,
+		underlyingWriter:    w,
+		compressionBuffer:   *compressionBufferP,
+		decompressionBuffer: *decompressionBufferP,
+		firstError:          err,
+		resultBuffer:        new(C.decompressStream2_result),
+	}
+}
+
+func (w *decompressWriter) Write(p []byte) (int, error) {
+	if w.firstError != nil {
+		return 0, w.firstError
+	}
+
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// Record the original input length to return later
+	originalLen := len(p)
+
+	// Process the input in chunks
+	for len(p) > 0 {
+		// Ensure we have enough space in our compression buffer
+		if len(w.compressionBuffer) < len(p) {
+			w.compressionBuffer = resize(w.compressionBuffer, len(p))
+		}
+
+		// Copy input into our buffer
+		copy(w.compressionBuffer, p)
+
+		// C code
+		var srcPtr *byte
+		if len(p) > 0 {
+			srcPtr = &w.compressionBuffer[0]
+		}
+
+		C.ZSTD_decompressStream_wrapper(
+			w.resultBuffer,
+			w.ctx,
+			unsafe.Pointer(&w.decompressionBuffer[0]),
+			C.size_t(len(w.decompressionBuffer)),
+			unsafe.Pointer(srcPtr),
+			C.size_t(len(p)),
+		)
+		retCode := int(w.resultBuffer.return_code)
+
+		// Keep src alive for garbage collector
+		runtime.KeepAlive(w.compressionBuffer)
+
+		if err := getError(retCode); err != nil {
+			w.firstError = fmt.Errorf("failed to decompress: %w", err)
+			return 0, w.firstError
+		}
+
+		// Write decompressed data to the underlying writer
+		bytesDecompressed := int(w.resultBuffer.bytes_written)
+		if bytesDecompressed > 0 {
+			_, err := w.underlyingWriter.Write(w.decompressionBuffer[:bytesDecompressed])
+			if err != nil {
+				w.firstError = fmt.Errorf("failed to write to underlying writer: %w", err)
+				return 0, w.firstError
+			}
+		}
+
+		// Move to the next chunk of input
+		bytesConsumed := int(w.resultBuffer.bytes_consumed)
+		p = p[bytesConsumed:]
+
+		// Resize buffers if needed based on hint
+		nsize := retCode // Hint for next buffer size
+		if nsize > 0 && len(w.decompressionBuffer) < nsize {
+			w.decompressionBuffer = resize(w.decompressionBuffer, nsize)
+		}
+	}
+
+	return originalLen, nil
+}
+
+func (w *decompressWriter) Close() error {
+	if w.firstError != nil {
+		return w.firstError
+	}
+
+	// Return buffers to pool
+	cb := w.compressionBuffer
+	db := w.decompressionBuffer
+
+	// Ensure we don't reuse buffers
+	w.firstError = errReaderClosed
+	w.compressionBuffer = nil
+	w.decompressionBuffer = nil
+
+	cPool.Put(&cb)
+	dPool.Put(&db)
+
+	// Free C resources
+	return getError(int(C.ZSTD_freeDStream(w.ctx)))
+}
