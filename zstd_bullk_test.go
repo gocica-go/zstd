@@ -3,6 +3,7 @@ package zstd
 import (
 	"bytes"
 	"encoding/base64"
+	"io"
 	"math/rand"
 	"regexp"
 	"strings"
@@ -272,6 +273,318 @@ func BenchmarkBulkDecompress(b *testing.B) {
 		_, err := p.Decompress(nil, compressedPayload)
 		if err != nil {
 			b.Error("failed to decompress")
+		}
+	}
+}
+
+// --- TDD: BulkProcessor Stream API Tests ---
+
+func TestBulkStreamWriterSimple(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+	payload := []byte("We're building a platform that engineers love to use.")
+
+	var buf bytes.Buffer
+	w := p.NewWriter(&buf)
+
+	n, err := w.Write(payload)
+	if err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("expected to write %d bytes, wrote %d", len(payload), n)
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	// Decompress using the same BulkProcessor
+	decompressed, err := p.Decompress(nil, buf.Bytes())
+	if err != nil {
+		t.Fatalf("failed to decompress: %v", err)
+	}
+
+	if !bytes.Equal(payload, decompressed) {
+		t.Fatalf("payload mismatch: expected %q, got %q", payload, decompressed)
+	}
+}
+
+func TestBulkStreamWriterEmpty(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+
+	var buf bytes.Buffer
+	w := p.NewWriter(&buf)
+
+	n, err := w.Write([]byte{})
+	if err != nil {
+		t.Fatalf("failed to write empty: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected to write 0 bytes, wrote %d", n)
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	// Should produce valid zstd frame
+	if len(buf.Bytes()) == 0 {
+		t.Fatal("expected non-empty output for empty input")
+	}
+}
+
+func TestBulkStreamWriterFlush(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+	payload := []byte("test flush")
+
+	var buf bytes.Buffer
+	w := p.NewWriter(&buf)
+
+	_, err := w.Write(payload)
+	if err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	err = w.Flush()
+	if err != nil {
+		t.Fatalf("failed to flush: %v", err)
+	}
+
+	// Data should be available after flush
+	if buf.Len() == 0 {
+		t.Fatal("expected data after flush")
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+}
+
+func TestBulkStreamReaderSimple(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+	payload := []byte("We're building a platform that engineers love to use.")
+
+	// Compress using BulkProcessor
+	compressed, err := p.Compress(nil, payload)
+	if err != nil {
+		t.Fatalf("failed to compress: %v", err)
+	}
+
+	// Decompress using BulkReader
+	r := p.NewReader(bytes.NewReader(compressed))
+	decompressed, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
+	err = r.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	if !bytes.Equal(payload, decompressed) {
+		t.Fatalf("payload mismatch: expected %q, got %q", payload, decompressed)
+	}
+}
+
+func TestBulkStreamReaderEmpty(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+
+	// Compress empty data
+	compressed, err := p.Compress(nil, []byte{})
+	if err != nil {
+		t.Fatalf("failed to compress: %v", err)
+	}
+
+	// Decompress using BulkReader
+	r := p.NewReader(bytes.NewReader(compressed))
+	decompressed, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
+	err = r.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	if len(decompressed) != 0 {
+		t.Fatalf("expected empty output, got %d bytes", len(decompressed))
+	}
+}
+
+func TestBulkStreamWriterReaderRoundtrip(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+
+	for i := 0; i < 100; i++ {
+		payload := []byte(getRandomText())
+
+		// Compress using BulkWriter
+		var buf bytes.Buffer
+		w := p.NewWriter(&buf)
+		_, err := w.Write(payload)
+		if err != nil {
+			t.Fatalf("failed to write: %v", err)
+		}
+		err = w.Close()
+		if err != nil {
+			t.Fatalf("failed to close writer: %v", err)
+		}
+
+		// Decompress using BulkReader
+		r := p.NewReader(&buf)
+		decompressed, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("failed to read: %v", err)
+		}
+		err = r.Close()
+		if err != nil {
+			t.Fatalf("failed to close reader: %v", err)
+		}
+
+		if !bytes.Equal(payload, decompressed) {
+			t.Fatalf("roundtrip failed: payload mismatch")
+		}
+	}
+}
+
+func TestBulkDecompressWriterSimple(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+	payload := []byte("We're building a platform that engineers love to use.")
+
+	// Compress using BulkProcessor
+	compressed, err := p.Compress(nil, payload)
+	if err != nil {
+		t.Fatalf("failed to compress: %v", err)
+	}
+
+	// Decompress using BulkDecompressWriter
+	var buf bytes.Buffer
+	w := p.NewDecompressWriter(&buf)
+
+	n, err := w.Write(compressed)
+	if err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+	if n != len(compressed) {
+		t.Fatalf("expected to write %d bytes, wrote %d", len(compressed), n)
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	if !bytes.Equal(payload, buf.Bytes()) {
+		t.Fatalf("payload mismatch: expected %q, got %q", payload, buf.Bytes())
+	}
+}
+
+func TestBulkDecompressWriterEmpty(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+
+	// Compress empty data
+	compressed, err := p.Compress(nil, []byte{})
+	if err != nil {
+		t.Fatalf("failed to compress: %v", err)
+	}
+
+	// Decompress using BulkDecompressWriter
+	var buf bytes.Buffer
+	w := p.NewDecompressWriter(&buf)
+
+	_, err = w.Write(compressed)
+	if err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	if len(buf.Bytes()) != 0 {
+		t.Fatalf("expected empty output, got %d bytes", len(buf.Bytes()))
+	}
+}
+
+func TestBulkDecompressWriterChunks(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+	payload := []byte("We're building a platform that engineers love to use. Join us!")
+
+	// Compress using BulkProcessor
+	compressed, err := p.Compress(nil, payload)
+	if err != nil {
+		t.Fatalf("failed to compress: %v", err)
+	}
+
+	// Split compressed data into chunks
+	chunkSize := 4
+	var chunks [][]byte
+	for i := 0; i < len(compressed); i += chunkSize {
+		end := i + chunkSize
+		if end > len(compressed) {
+			end = len(compressed)
+		}
+		chunks = append(chunks, compressed[i:end])
+	}
+
+	// Decompress using BulkDecompressWriter with chunks
+	var buf bytes.Buffer
+	w := p.NewDecompressWriter(&buf)
+
+	for _, chunk := range chunks {
+		_, err := w.Write(chunk)
+		if err != nil {
+			t.Fatalf("failed to write chunk: %v", err)
+		}
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	if !bytes.Equal(payload, buf.Bytes()) {
+		t.Fatalf("payload mismatch: expected %q, got %q", payload, buf.Bytes())
+	}
+}
+
+func TestBulkStreamWriterDecompressWriterRoundtrip(t *testing.T) {
+	p := newBulkProcessor(t, dict, BestSpeed)
+
+	for i := 0; i < 100; i++ {
+		payload := []byte(getRandomText())
+
+		// Compress using BulkWriter
+		var compBuf bytes.Buffer
+		w := p.NewWriter(&compBuf)
+		_, err := w.Write(payload)
+		if err != nil {
+			t.Fatalf("failed to write: %v", err)
+		}
+		err = w.Close()
+		if err != nil {
+			t.Fatalf("failed to close writer: %v", err)
+		}
+
+		// Decompress using BulkDecompressWriter
+		var decompBuf bytes.Buffer
+		dw := p.NewDecompressWriter(&decompBuf)
+		_, err = dw.Write(compBuf.Bytes())
+		if err != nil {
+			t.Fatalf("failed to decompress write: %v", err)
+		}
+		err = dw.Close()
+		if err != nil {
+			t.Fatalf("failed to close decompress writer: %v", err)
+		}
+
+		if !bytes.Equal(payload, decompBuf.Bytes()) {
+			t.Fatalf("roundtrip failed: payload mismatch")
 		}
 	}
 }
